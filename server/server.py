@@ -1,0 +1,273 @@
+from flask import Flask, send_from_directory, render_template_string, redirect, request
+import pychromecast
+import requests
+import logging
+from logging.handlers import RotatingFileHandler
+import pytz
+from datetime import datetime
+import time
+
+
+app = Flask(__name__)
+
+# --- CONFIGURATION ---
+SERVER_IP = "192.168.0.203" # Replace with your BeagleBone IP
+MINI_IP = "192.168.0.137"
+MINI_NAME = "Family Room speaker" 
+ESP_IP = None                  # Dynamically assigned by ESP8266
+IS_ARMED = False               # Global state tracker
+CURRENT_VOLUME = 0.5
+LAST_HEARTBEAT_TIME = 0
+HEARTBEAT_TIMEOUT = 660  # Seconds before we consider the ESP offline (11 minutes, because heartbeat broadcast from ESP is at 10 min)
+
+def get_system_status():
+    """Returns 'OFFLINE' if we haven't heard from the ESP in 90s, else returns the armed state."""
+    if (time.time() - LAST_HEARTBEAT_TIME) > HEARTBEAT_TIMEOUT:
+        return "OFFLINE"
+    return "ARMED" if IS_ARMED else "DISARMED"
+
+# --- CONFIGURATION ---
+IST = pytz.timezone('Asia/Kolkata')
+
+# Configure logging
+logger = logging.getLogger("BabyMonitor")
+logger.setLevel(logging.INFO)
+# Rotate logs: Max 500KB per file, keep 3 backup files
+handler = RotatingFileHandler('baby_monitor.log', maxBytes=500000, backupCount=3)
+
+# Force logging to use IST
+def ist_converter(*args):
+    return datetime.now(IST).timetuple()
+
+formatter = logging.Formatter('%(asctime)s - %(message)s')
+formatter.converter = ist_converter # Apply the IST converter
+
+handler.setFormatter(formatter)
+logger.addHandler(handler)
+
+# Memory store for the last 20 logs to display on the dashboard
+recent_logs = []
+
+def add_log(message):
+    timestamp = datetime.now(IST).strftime('%H:%M:%S')
+    log_entry = f"[{timestamp}] {message}"
+    
+    # Add to memory for dashboard (Top 20)
+    recent_logs.insert(0, log_entry)
+    if len(recent_logs) > 20:
+        recent_logs.pop()
+    
+    # Write to rotated file
+    logger.info(message)
+
+def cast_audio(filename):
+    """Casts audio using Direct IP (known_hosts) or falls back to mDNS."""
+    browser = None
+    try:
+        # By passing known_hosts, PyChromecast bypasses the mDNS broadcast and directly polls the IP
+        if MINI_IP:
+            chromecasts, browser = pychromecast.get_listed_chromecasts(friendly_names=[MINI_NAME], known_hosts=[MINI_IP])
+        else:
+            chromecasts, browser = pychromecast.get_listed_chromecasts(friendly_names=[MINI_NAME])
+
+        if not chromecasts:
+            add_log("CAST ERROR: Google Mini not found on the network.")
+            return
+
+        cast = chromecasts[0]
+        cast.wait()
+
+        # Use the dynamic volume set by the slider
+        cast.set_volume(CURRENT_VOLUME)
+
+        mc = cast.media_controller
+        mp3_url = f"http://{SERVER_IP}:5000/static/{filename}"
+
+        mc.play_media(mp3_url, 'audio/mp3')
+        mc.block_until_active()
+
+    except Exception as e:
+        add_log(f"CAST ERROR: Failed to connect to speaker. ({e})")
+
+    finally:
+        # The finally block guarantees the browser is stopped, even if the connection crashes halfway through
+        if browser:
+            pychromecast.discovery.stop_discovery(browser)
+
+# --- HTML DASHBOARD TEMPLATE ---
+HTML_PAGE = """
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Baby Monitor Hub</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta http-equiv="refresh" content="30">
+    <style>
+        body { font-family: Arial; text-align: center; margin-top: 50px; background-color: #f4f4f4;}
+        .status { font-size: 28px; font-weight: bold; margin-bottom: 20px; padding: 10px; border-radius: 5px; display: inline-block; }
+        .status-armed { background-color: #d4edda; color: #155724; border: 2px solid #c3e6cb; }
+        .status-disarmed { background-color: #f8d7da; color: #721c24; border: 2px solid #f5c6cb; }
+        .btn { padding: 20px 40px; font-size: 24px; margin: 10px; border: none; border-radius: 10px; color: white; text-decoration: none; display: inline-block;}
+        .btn-arm { background-color: #28a745; }
+        .btn-disarm { background-color: #dc3545; }
+        .log-box { width: 80%; max-width: 500px; margin: 30px auto; background: white; padding: 20px; text-align: left; border-radius: 8px; box-shadow: 0px 0px 10px #ccc;}
+    </style>
+</head>
+<body>
+    <h1>Baby Monitor Control</h1>
+
+    <div class="control-box">
+    <h3>Alert Volume</h3>
+    <form action="/set_volume" method="POST">
+        <input type="range" name="volume" min="0" max="100" value="{{ current_volume * 100 }}" style="width: 80%;">
+        <br>
+        <button type="submit" class="btn" style="background-color: #007bff;">Set Volume</button>
+    </form>
+    </div>
+    
+    {% set status = get_system_status() %}
+    {% if status == 'OFFLINE' %}
+        <div class="status" style="background-color: #6c757d; color: white; border: 2px solid #5a6268;">
+            CURRENT STATUS: OFFLINE
+        </div>
+    {% elif status == 'ARMED' %}
+        <div class="status status-armed">CURRENT STATUS: ARMED</div>
+    {% else %}
+        <div class="status status-disarmed">CURRENT STATUS: DISARMED</div>
+    {% endif %}
+    
+    <br>
+
+    {% if status == 'OFFLINE' %}
+        <p style="color: #6c757d; font-style: italic;">Control unavailable while system is OFFLINE.</p>
+    {% else %}
+        <a href="/command/arm" class="btn btn-arm">ARM SYSTEM</a>
+        <a href="/command/disarm" class="btn btn-disarm">DISARM SYSTEM</a>
+    {% endif %}
+    
+    <div class="log-box">
+    <h3>Recent System Logs:</h3>
+    <a href="/logs">View Full Archived Logs</a>
+    <ul>
+        {% for log in logs %}
+            <li>{{ log }}</li>
+        {% endfor %}
+    </ul>
+</div>
+</body>
+</html>
+"""
+
+@app.route('/register', methods=['GET'])
+def register_esp():
+    global ESP_IP, IS_ARMED, LAST_HEARTBEAT_TIME
+    
+    # Update the heartbeat whenever the ESP talks to us
+    LAST_HEARTBEAT_TIME = time.time()
+    
+    incoming_ip = request.args.get('ip')
+    incoming_state = request.args.get('state') # Get the state from ESP
+    
+    if incoming_ip:
+        ESP_IP = incoming_ip
+        
+        # Sync the Hub's state to match the ESP8266
+        if incoming_state:
+            IS_ARMED = True if incoming_state == 'arm' else False
+            add_log(f"ESP8266 registered. Hub synced to state: {incoming_state.upper()}")
+        
+        return "IP and State Registered", 200
+    return "Missing parameters", 400
+
+# --- WEB UI ROUTE ---
+@app.route('/')
+def dashboard():
+    return render_template_string(HTML_PAGE, logs=recent_logs, is_armed=IS_ARMED, current_volume=CURRENT_VOLUME,
+        get_system_status=get_system_status)
+
+@app.route('/logs')
+def view_all_logs():
+    try:
+        with open('baby_monitor.log', 'r') as f:
+            # Read all lines, reverse them to show latest first
+            all_logs = f.readlines()[::-1]
+        
+        # Simple HTML for the log viewer
+        log_html = """
+        <html>
+        <body style="font-family: monospace; padding: 20px;">
+            <h1>Full System Logs</h1>
+            <a href="/">Back to Dashboard</a>
+            <hr>
+            <pre>""" + "".join(all_logs) + """</pre>
+        </body>
+        </html>
+        """
+        return log_html
+    except FileNotFoundError:
+        return "No logs found yet."
+
+@app.route('/set_volume', methods=['POST'])
+def set_volume():
+    global CURRENT_VOLUME
+    # Get value from slider (0-100) and convert to float (0.0-1.0)
+    new_vol = int(request.form.get('volume')) / 100.0
+    CURRENT_VOLUME = new_vol
+    add_log(f"Volume updated to {int(new_vol * 100)}%")
+    return redirect('/')
+
+@app.route('/command/<action>')
+def send_command(action):
+    global ESP_IP, IS_ARMED
+    
+    if not ESP_IP:
+        add_log("ERROR: Cannot send command. ESP8266 has not registered its IP yet.")
+        return redirect('/')
+        
+    try:
+        # Ping the ESP8266 to change its state
+        response = requests.get(f"http://{ESP_IP}/{action}", timeout=3)
+        
+        if response.status_code == 200:
+            # --- DISTINCT AUDIO AND STATE LOGIC ---
+            if action == 'arm':
+                IS_ARMED = True
+                add_log("System successfully ARMED via Web UI.")
+                cast_audio("ding.mp3") 
+            elif action == 'disarm':
+                IS_ARMED = False
+                add_log("System successfully DISARMED via Web UI.")
+                cast_audio("dong.mp3") 
+            # --------------------------------------
+        else:
+            add_log(f"ERROR: ESP8266 returned status {response.status_code}.")
+            
+    except Exception as e:
+        add_log(f"CRITICAL ERROR: Could not reach ESP8266 at {ESP_IP}.")
+        
+    return redirect('/')
+
+# --- RADAR TRIGGER ROUTE ---
+@app.route('/trigger', methods=['GET'])
+def trigger_alert():
+    global ESP_IP
+    
+    # --- SELF HEALING LOGIC ---
+    incoming_ip = request.remote_addr
+    if ESP_IP != incoming_ip:
+        ESP_IP = incoming_ip
+        add_log(f"Auto-healed connection: ESP8266 found at {ESP_IP}")
+    # --------------------------
+
+    add_log("WAKEUP DETECTED: Movement triggered the radar!")
+    cast_audio("chime.mp3") 
+    return "Alert logged and casted", 200
+
+# --- STATIC FILE SERVER ---
+@app.route('/static/<filename>')
+def serve_audio(filename):
+    return send_from_directory('static', filename)
+
+if __name__ == '__main__':
+    add_log("BeagleBone Hub Booted. Waiting for ESP8266...")
+    app.run(host='0.0.0.0', port=5000)

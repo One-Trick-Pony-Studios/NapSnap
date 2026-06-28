@@ -1,0 +1,17 @@
+[Unit]
+Description=Baby Monitor Local Server
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+User=debian
+WorkingDirectory=/home/debian/baby_monitor
+
+# Updated the path to use the anshul home directory
+ExecStart=/home/debian/baby_monitor/venv/bin/python server.py
+
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
