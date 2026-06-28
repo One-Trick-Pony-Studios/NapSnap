@@ -10,18 +10,23 @@ NapSnap is a local-first IoT baby monitoring system designed to detect movement 
 ## Server Installation
 The server runs on the BeagleBone Black (Debian IoT).
 
-1. **Setup Environment:**
-   ```bash
-   python3 -m venv venv
-   source venv/bin/activate
-   pip install -r requirements.txt
-   ```
+### 1. Network Configuration (Static IP)
+To ensure the ESP8266 and Google Mini can reliably communicate with the Hub, assign a **Static IP** to your BeagleBone via your router's DHCP reservation settings. 
+* **Action:** Log into your router, find the BeagleBone's MAC address, and reserve its current IP (e.g., `192.168.1.50`) so it never changes after a reboot.
 
-2. **Systemd Service:**
+### 2. Setup Environment
+```bash
+python3 -m venv venv
+source venv/bin/activate
+pip install -r requirements.txt
+```
+
+### 3. Systemd Service
+
 The server is managed via `systemd` to ensure 24/7 uptime and auto-restart on boot.
+
 * Copy `babymonitor.service` to `/etc/systemd/system/`.
 * Run: `sudo systemctl enable babymonitor.service && sudo systemctl start babymonitor.service`
-
 
 ## ESP Usage
 
