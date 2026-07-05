@@ -1,4 +1,4 @@
-from flask import Flask, send_from_directory, render_template_string, redirect, request
+from flask import Flask, send_from_directory, render_template_string, redirect, request, jsonify
 import pychromecast
 import requests
 import logging
@@ -6,7 +6,7 @@ from logging.handlers import RotatingFileHandler
 import pytz
 from datetime import datetime
 import time
-
+import threading
 
 app = Flask(__name__)
 
@@ -18,13 +18,16 @@ ESP_IP = None                  # Dynamically assigned by ESP8266
 IS_ARMED = False               # Global state tracker
 CURRENT_VOLUME = 0.5
 LAST_HEARTBEAT_TIME = 0
-HEARTBEAT_TIMEOUT = 660  # Seconds before we consider the ESP offline (11 minutes, because heartbeat broadcast from ESP is at 10 min)
+HEARTBEAT_TIMEOUT = 660  # Seconds before we consider the ESP offline
+
+state_lock = threading.RLock()
 
 def get_system_status():
-    """Returns 'OFFLINE' if we haven't heard from the ESP in 90s, else returns the armed state."""
-    if (time.time() - LAST_HEARTBEAT_TIME) > HEARTBEAT_TIMEOUT:
-        return "OFFLINE"
-    return "ARMED" if IS_ARMED else "DISARMED"
+    """Returns 'OFFLINE' if we haven't heard from the ESP in HEARTBEAT_TIMEOUT, else returns the armed state."""
+    with state_lock:
+        if (time.time() - LAST_HEARTBEAT_TIME) > HEARTBEAT_TIMEOUT:
+            return "OFFLINE"
+        return "ARMED" if IS_ARMED else "DISARMED"
 
 # --- CONFIGURATION ---
 IST = pytz.timezone('Asia/Kolkata')
@@ -52,15 +55,20 @@ def add_log(message):
     timestamp = datetime.now(IST).strftime('%H:%M:%S')
     log_entry = f"[{timestamp}] {message}"
     
-    # Add to memory for dashboard (Top 20)
-    recent_logs.insert(0, log_entry)
-    if len(recent_logs) > 20:
-        recent_logs.pop()
+    with state_lock:
+        # Add to memory for dashboard (Top 20)
+        recent_logs.insert(0, log_entry)
+        if len(recent_logs) > 20:
+            recent_logs.pop()
     
     # Write to rotated file
     logger.info(message)
 
 def cast_audio(filename):
+    """Launches audio casting in a background thread to prevent blocking the Flask server."""
+    threading.Thread(target=_cast_audio_worker, args=(filename,), daemon=True).start()
+
+def _cast_audio_worker(filename):
     """Casts audio using Direct IP (known_hosts) or falls back to mDNS."""
     browser = None
     try:
@@ -77,8 +85,11 @@ def cast_audio(filename):
         cast = chromecasts[0]
         cast.wait()
 
-        # Use the dynamic volume set by the slider
-        cast.set_volume(CURRENT_VOLUME)
+        # Retrieve dynamic volume under lock
+        with state_lock:
+            vol = CURRENT_VOLUME
+
+        cast.set_volume(vol)
 
         mc = cast.media_controller
         mp3_url = f"http://{SERVER_IP}:5000/static/{filename}"
@@ -101,59 +112,142 @@ HTML_PAGE = """
 <head>
     <title>Baby Monitor Hub</title>
     <meta name="viewport" content="width=device-width, initial-scale=1">
-    <meta http-equiv="refresh" content="30">
     <style>
         body { font-family: Arial; text-align: center; margin-top: 50px; background-color: #f4f4f4;}
         .status { font-size: 28px; font-weight: bold; margin-bottom: 20px; padding: 10px; border-radius: 5px; display: inline-block; }
         .status-armed { background-color: #d4edda; color: #155724; border: 2px solid #c3e6cb; }
         .status-disarmed { background-color: #f8d7da; color: #721c24; border: 2px solid #f5c6cb; }
-        .btn { padding: 20px 40px; font-size: 24px; margin: 10px; border: none; border-radius: 10px; color: white; text-decoration: none; display: inline-block;}
+        .status-offline { background-color: #6c757d; color: white; border: 2px solid #5a6268; }
+        .btn { padding: 20px 40px; font-size: 24px; margin: 10px; border: none; border-radius: 10px; color: white; text-decoration: none; display: inline-block; cursor: pointer;}
         .btn-arm { background-color: #28a745; }
         .btn-disarm { background-color: #dc3545; }
+        .btn:disabled { background-color: #cccccc; color: #666666; cursor: not-allowed; opacity: 0.6; }
         .log-box { width: 80%; max-width: 500px; margin: 30px auto; background: white; padding: 20px; text-align: left; border-radius: 8px; box-shadow: 0px 0px 10px #ccc;}
+        .control-box { margin-bottom: 20px; }
     </style>
 </head>
 <body>
     <h1>Baby Monitor Control</h1>
 
     <div class="control-box">
-    <h3>Alert Volume</h3>
-    <form action="/set_volume" method="POST">
-        <input type="range" name="volume" min="0" max="100" value="{{ current_volume * 100 }}" style="width: 80%;">
-        <br>
-        <button type="submit" class="btn" style="background-color: #007bff;">Set Volume</button>
-    </form>
+        <h3>Alert Volume: <span id="vol-display">{{ (current_volume * 100)|int }}</span>%</h3>
+        <input type="range" id="vol-slider" min="0" max="100" value="{{ (current_volume * 100)|int }}" style="width: 80%;" onchange="updateVolume(this.value)">
     </div>
     
-    {% set status = get_system_status() %}
-    {% if status == 'OFFLINE' %}
-        <div class="status" style="background-color: #6c757d; color: white; border: 2px solid #5a6268;">
-            CURRENT STATUS: OFFLINE
-        </div>
-    {% elif status == 'ARMED' %}
-        <div class="status status-armed">CURRENT STATUS: ARMED</div>
-    {% else %}
-        <div class="status status-disarmed">CURRENT STATUS: DISARMED</div>
-    {% endif %}
+    <div id="status-container" class="status">
+        CURRENT STATUS: LOADING...
+    </div>
     
     <br>
-
-    {% if status == 'OFFLINE' %}
-        <p style="color: #6c757d; font-style: italic;">Control unavailable while system is OFFLINE.</p>
-    {% else %}
-        <a href="/command/arm" class="btn btn-arm">ARM SYSTEM</a>
-        <a href="/command/disarm" class="btn btn-disarm">DISARM SYSTEM</a>
-    {% endif %}
+    <div id="offline-note" style="color: #6c757d; font-style: italic; display: none;">
+        Control unavailable while system is OFFLINE.
+    </div>
+    
+    <div id="control-buttons">
+        <button id="btn-arm" onclick="sendCommand('arm')" class="btn btn-arm">ARM SYSTEM</button>
+        <button id="btn-disarm" onclick="sendCommand('disarm')" class="btn btn-disarm">DISARM SYSTEM</button>
+    </div>
     
     <div class="log-box">
-    <h3>Recent System Logs:</h3>
-    <a href="/logs">View Full Archived Logs</a>
-    <ul>
-        {% for log in logs %}
-            <li>{{ log }}</li>
-        {% endfor %}
-    </ul>
-</div>
+        <h3>Recent System Logs:</h3>
+        <a href="/logs">View Full Archived Logs</a>
+        <ul id="log-list">
+            {% for log in logs %}
+                <li>{{ log }}</li>
+            {% endfor %}
+        </ul>
+    </div>
+
+    <script>
+        function updateUI(data) {
+            var statusContainer = document.getElementById('status-container');
+            var offlineNote = document.getElementById('offline-note');
+            var btnArm = document.getElementById('btn-arm');
+            var btnDisarm = document.getElementById('btn-disarm');
+            var volDisplay = document.getElementById('vol-display');
+            var volSlider = document.getElementById('vol-slider');
+            var logList = document.getElementById('log-list');
+
+            // Update status class and text
+            statusContainer.innerText = "CURRENT STATUS: " + data.status;
+            statusContainer.className = "status";
+            if (data.status === "OFFLINE") {
+                statusContainer.classList.add("status-offline");
+                offlineNote.style.display = "block";
+                btnArm.disabled = true;
+                btnDisarm.disabled = true;
+            } else if (data.status === "ARMED") {
+                statusContainer.classList.add("status-armed");
+                offlineNote.style.display = "none";
+                btnArm.disabled = true;  // Gray out ARM
+                btnDisarm.disabled = false;
+            } else {
+                statusContainer.classList.add("status-disarmed");
+                offlineNote.style.display = "none";
+                btnArm.disabled = false;
+                btnDisarm.disabled = true; // Gray out DISARM
+            }
+
+            // Update volume display and slider if not dragging
+            volDisplay.innerText = data.current_volume;
+            if (document.activeElement !== volSlider) {
+                volSlider.value = data.current_volume;
+            }
+
+            // Update logs using ES5 loop
+            var logHTML = "";
+            if (data.logs) {
+                for (var i = 0; i < data.logs.length; i++) {
+                    logHTML += "<li>" + data.logs[i] + "</li>";
+                }
+            }
+            logList.innerHTML = logHTML;
+        }
+
+        function fetchStatus() {
+            fetch('/api/status')
+                .then(function(res) { return res.json(); })
+                .then(function(data) { updateUI(data); })
+                .catch(function(err) { console.error("Error fetching status:", err); });
+        }
+
+        function sendCommand(action) {
+            var btnArm = document.getElementById('btn-arm');
+            var btnDisarm = document.getElementById('btn-disarm');
+            // Disable immediately to prevent double submission
+            btnArm.disabled = true;
+            btnDisarm.disabled = true;
+
+            fetch('/command/' + action)
+                .then(function(res) {
+                    fetchStatus();
+                })
+                .catch(function(err) {
+                    console.error("Error sending command:", err);
+                    fetchStatus();
+                });
+        }
+
+        function updateVolume(val) {
+            var formData = new URLSearchParams();
+            formData.append('volume', val);
+
+            fetch('/set_volume', {
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/x-www-form-urlencoded'
+                },
+                body: formData
+            })
+            .then(function(res) { fetchStatus(); })
+            .catch(function(err) { console.error("Error setting volume:", err); });
+        }
+
+        // Poll every 5 seconds for updates
+        setInterval(fetchStatus, 5000);
+        // Run initial update
+        fetchStatus();
+    </script>
 </body>
 </html>
 """
@@ -162,37 +256,58 @@ HTML_PAGE = """
 def register_esp():
     global ESP_IP, IS_ARMED, LAST_HEARTBEAT_TIME
     
-    # Update the heartbeat whenever the ESP talks to us
-    LAST_HEARTBEAT_TIME = time.time()
-    
     incoming_ip = request.args.get('ip')
     incoming_state = request.args.get('state') # Get the state from ESP
     
     if incoming_ip:
-        ESP_IP = incoming_ip
-        
-        # Sync the Hub's state to match the ESP8266
-        if incoming_state:
-            IS_ARMED = True if incoming_state == 'arm' else False
-            add_log(f"ESP8266 registered. Hub synced to state: {incoming_state.upper()}")
+        with state_lock:
+            # Update the heartbeat whenever the ESP talks to us
+            LAST_HEARTBEAT_TIME = time.time()
+            
+            old_ip = ESP_IP
+            old_state = IS_ARMED
+            incoming_state_bool = (incoming_state == 'arm') if incoming_state else IS_ARMED
+            
+            ip_changed = (old_ip != incoming_ip)
+            state_changed = (old_state != incoming_state_bool)
+            
+            ESP_IP = incoming_ip
+            IS_ARMED = incoming_state_bool
+
+        if ip_changed or state_changed or not old_ip:
+            # Sync or registration event: log to dashboard and rotate log
+            add_log(f"ESP8266 registered. IP: {incoming_ip}, State synced: {incoming_state.upper() if incoming_state else 'N/A'}")
+        else:
+            # Regular keepalive: write only to rotated log file (not dashboard) to minimize noise
+            logger.info(f"ESP8266 heartbeat keepalive from IP {incoming_ip}.")
         
         return "IP and State Registered", 200
     return "Missing parameters", 400
 
+# --- API ENDPOINT FOR AJAX STATUS ---
+@app.route('/api/status', methods=['GET'])
+def api_status():
+    return jsonify({
+        "status": get_system_status(),
+        "is_armed": IS_ARMED,
+        "current_volume": int(CURRENT_VOLUME * 100),
+        "logs": recent_logs
+    })
+
 # --- WEB UI ROUTE ---
 @app.route('/')
 def dashboard():
-    return render_template_string(HTML_PAGE, logs=recent_logs, is_armed=IS_ARMED, current_volume=CURRENT_VOLUME,
-        get_system_status=get_system_status)
+    with state_lock:
+        logs_copy = list(recent_logs)
+        vol_copy = CURRENT_VOLUME
+    return render_template_string(HTML_PAGE, logs=logs_copy, current_volume=vol_copy)
 
 @app.route('/logs')
 def view_all_logs():
     try:
         with open('baby_monitor.log', 'r') as f:
-            # Read all lines, reverse them to show latest first
             all_logs = f.readlines()[::-1]
         
-        # Simple HTML for the log viewer
         log_html = """
         <html>
         <body style="font-family: monospace; padding: 20px;">
@@ -210,54 +325,68 @@ def view_all_logs():
 @app.route('/set_volume', methods=['POST'])
 def set_volume():
     global CURRENT_VOLUME
-    # Get value from slider (0-100) and convert to float (0.0-1.0)
     new_vol = int(request.form.get('volume')) / 100.0
-    CURRENT_VOLUME = new_vol
+    with state_lock:
+        CURRENT_VOLUME = new_vol
     add_log(f"Volume updated to {int(new_vol * 100)}%")
-    return redirect('/')
+    return "Volume updated", 200
 
 @app.route('/command/<action>')
 def send_command(action):
     global ESP_IP, IS_ARMED
     
-    if not ESP_IP:
+    with state_lock:
+        esp_ip_copy = ESP_IP
+    
+    if not esp_ip_copy:
         add_log("ERROR: Cannot send command. ESP8266 has not registered its IP yet.")
-        return redirect('/')
+        return "No IP registered", 400
         
     try:
-        # Ping the ESP8266 to change its state
-        response = requests.get(f"http://{ESP_IP}/{action}", timeout=3)
+        response = requests.get(f"http://{esp_ip_copy}/{action}", timeout=3)
         
         if response.status_code == 200:
-            # --- DISTINCT AUDIO AND STATE LOGIC ---
+            with state_lock:
+                LAST_HEARTBEAT_TIME = time.time()
+                if action == 'arm':
+                    IS_ARMED = True
+                elif action == 'disarm':
+                    IS_ARMED = False
+            
             if action == 'arm':
-                IS_ARMED = True
                 add_log("System successfully ARMED via Web UI.")
                 cast_audio("ding.mp3") 
             elif action == 'disarm':
-                IS_ARMED = False
                 add_log("System successfully DISARMED via Web UI.")
                 cast_audio("dong.mp3") 
-            # --------------------------------------
+            return "Command processed", 200
         else:
             add_log(f"ERROR: ESP8266 returned status {response.status_code}.")
+            return f"ESP error: {response.status_code}", 500
             
     except Exception as e:
-        add_log(f"CRITICAL ERROR: Could not reach ESP8266 at {ESP_IP}.")
-        
-    return redirect('/')
+        add_log(f"CRITICAL ERROR: Could not reach ESP8266 at {esp_ip_copy}.")
+        return "ESP unreachable", 500
 
 # --- RADAR TRIGGER ROUTE ---
 @app.route('/trigger', methods=['GET'])
 def trigger_alert():
-    global ESP_IP
+    global ESP_IP, LAST_HEARTBEAT_TIME, IS_ARMED
     
-    # --- SELF HEALING LOGIC ---
     incoming_ip = request.remote_addr
-    if ESP_IP != incoming_ip:
+    
+    with state_lock:
+        # Update heartbeat time to resolve reboot offline state bug
+        LAST_HEARTBEAT_TIME = time.time()
+        
+        # ESP sent a wakeup alert, so it is armed
+        IS_ARMED = True
+        
+        ip_changed = (ESP_IP != incoming_ip)
         ESP_IP = incoming_ip
-        add_log(f"Auto-healed connection: ESP8266 found at {ESP_IP}")
-    # --------------------------
+        
+    if ip_changed:
+        add_log(f"Auto-healed connection: ESP8266 found at {incoming_ip}")
 
     add_log("WAKEUP DETECTED: Movement triggered the radar!")
     cast_audio("chime.mp3") 
