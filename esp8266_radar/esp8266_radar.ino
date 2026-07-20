@@ -5,6 +5,13 @@
 #include <ESP8266mDNS.h>
 #include <WiFiUdp.h>
 #include <ArduinoOTA.h>
+#include <SoftwareSerial.h>
+#include <ld2410.h> // Library by Nick Reynolds
+
+// --- RADAR UART DEFINITIONS ---
+// Uses D5 (GPIO 14 - RX) and D6 (GPIO 12 - TX) to avoid D8 10k pull-down resistor signal attenuation
+SoftwareSerial radarSerial(14, 12); 
+ld2410 radar;
 
 // --- NETWORK CONFIGURATION ---
 const char* ssid = "SARA";
@@ -51,6 +58,15 @@ void setup() {
   // --- THE AUTOMATIC HANDSHAKE ---
   registerWithHub();
 
+  // Initialize SoftwareSerial for LD2410 Radar at 115200 baud
+  radarSerial.begin(115200);
+  if (radar.begin(radarSerial, false)) { // Non-blocking initialization
+    Serial.println("HLK-LD2410 UART SoftwareSerial attached at 115200 baud!");
+    radar.requestStartEngineeringMode(); // Enable real-time per-gate energy streaming
+  } else {
+    Serial.println("HLK-LD2410 UART initialization failed.");
+  }
+
   // --- DEFINE WEB SERVER ROUTES ---
   server.on("/arm", []() {
     isArmed = true;
@@ -65,6 +81,11 @@ void setup() {
     Serial.println("Received Command: DISARMED");
   });
 
+  server.on("/config_full", handleFullConfig);
+  server.on("/config_gates", handleMultiGateConfig);
+  server.on("/get_config", handleGetConfig);
+  server.on("/telemetry", handleTelemetry);
+
   server.begin();
   Serial.println("HTTP Server Started.");
 
@@ -77,6 +98,9 @@ void loop() {
   // Handle OTA updates and Web Client routing seamlessly in the background
   ArduinoOTA.handle();
   server.handleClient();
+  
+  // Continuously process incoming UART frames from the radar
+  radar.read();
 
   unsigned long currentMillis = millis();
   // --- THE HEARTBEAT ---
@@ -148,7 +172,7 @@ void loop() {
     writeIndex = 0;
   }
 
-  delay(100); // 100ms stability delay
+  yield(); // Non-blocking CPU yield allowing WiFi and SoftwareSerial background processing
 }
 
 
@@ -182,4 +206,147 @@ void sendAlert() {
     http.GET();
     http.end();
   }
+}
+
+// --- RADAR CONFIGURATION HANDLERS ---
+void handleFullConfig() {
+  if (server.hasArg("max_g") && server.hasArg("timeout") && server.hasArg("moving") && server.hasArg("static")) {
+    uint8_t max_g = server.arg("max_g").toInt();
+    uint16_t timeout = server.arg("timeout").toInt();
+    String movingParams = server.arg("moving");
+    String staticParams = server.arg("static");
+
+    Serial.println("\n[UART] Overwriting Full Radar Configuration...");
+
+    // 1. Set Max Distance Gate and Unmanned Timeout
+    bool configSuccess = radar.setMaxValues(max_g, max_g, timeout);
+
+    // 2. Set Sensitivity for each gate (0 to 8)
+    int m_lastIdx = 0, s_lastIdx = 0;
+
+    for (uint8_t i = 0; i <= 8; i++) {
+      int m_nextIdx = movingParams.indexOf(',', m_lastIdx);
+      int s_nextIdx = staticParams.indexOf(',', s_lastIdx);
+
+      uint8_t m_val = (m_nextIdx == -1) ? movingParams.substring(m_lastIdx).toInt() : movingParams.substring(m_lastIdx, m_nextIdx).toInt();
+      uint8_t s_val = (s_nextIdx == -1) ? staticParams.substring(s_lastIdx).toInt() : staticParams.substring(s_lastIdx, s_nextIdx).toInt();
+
+      radar.setGateSensitivityThreshold(i, m_val, s_val);
+
+      m_lastIdx = (m_nextIdx == -1) ? -1 : m_nextIdx + 1;
+      s_lastIdx = (s_nextIdx == -1) ? -1 : s_nextIdx + 1;
+
+      if (m_lastIdx == 0 || m_lastIdx == -1) m_lastIdx = movingParams.length();
+      if (s_lastIdx == 0 || s_lastIdx == -1) s_lastIdx = staticParams.length();
+    }
+
+    if (configSuccess) {
+      Serial.println("[UART] Full parameters committed to radar flash memory.");
+      server.send(200, "text/plain", "OK");
+    } else {
+      Serial.println("[UART] Radar config update finished.");
+      server.send(200, "text/plain", "OK");
+    }
+  } else {
+    server.send(400, "text/plain", "Missing Parameters");
+  }
+}
+
+void handleMultiGateConfig() {
+  if (server.hasArg("moving") && server.hasArg("static")) {
+    String movingParams = server.arg("moving");
+    String staticParams = server.arg("static");
+
+    Serial.println("\n[UART] Overwriting Multi-Gate Sensitivity Config...");
+
+    int m_lastIdx = 0, s_lastIdx = 0;
+
+    for (uint8_t i = 0; i <= 8; i++) {
+      int m_nextIdx = movingParams.indexOf(',', m_lastIdx);
+      int s_nextIdx = staticParams.indexOf(',', s_lastIdx);
+
+      uint8_t m_val = (m_nextIdx == -1) ? movingParams.substring(m_lastIdx).toInt() : movingParams.substring(m_lastIdx, m_nextIdx).toInt();
+      uint8_t s_val = (s_nextIdx == -1) ? staticParams.substring(s_lastIdx).toInt() : staticParams.substring(s_lastIdx, s_nextIdx).toInt();
+
+      radar.setGateSensitivityThreshold(i, m_val, s_val);
+
+      m_lastIdx = (m_nextIdx == -1) ? -1 : m_nextIdx + 1;
+      s_lastIdx = (s_nextIdx == -1) ? -1 : s_nextIdx + 1;
+
+      if (m_lastIdx == 0 || m_lastIdx == -1) m_lastIdx = movingParams.length();
+      if (s_lastIdx == 0 || s_lastIdx == -1) s_lastIdx = staticParams.length();
+    }
+
+    Serial.println("[UART] Sensitivity parameters committed to radar flash memory.");
+    server.send(200, "text/plain", "OK");
+  } else {
+    server.send(400, "text/plain", "Missing Parameters");
+  }
+}
+
+void handleGetConfig() {
+  if (radar.requestCurrentConfiguration()) {
+    String json = "{";
+    json += "\"max_gate\":" + String(radar.max_moving_gate) + ",";
+    json += "\"timeout\":" + String(radar.sensor_idle_time) + ",";
+    json += "\"moving_gates\":[";
+    for (int i = 0; i <= 8; i++) {
+      json += String(radar.motion_sensitivity[i]);
+      if (i < 8) json += ",";
+    }
+    json += "],\"static_gates\":[";
+    for (int i = 0; i <= 8; i++) {
+      json += String(radar.stationary_sensitivity[i]);
+      if (i < 8) json += ",";
+    }
+    json += "]}";
+    server.send(200, "application/json", json);
+  } else {
+    server.send(500, "text/plain", "Failed to query radar config");
+  }
+}
+
+void handleTelemetry() {
+  bool outState = (digitalRead(RADAR_PIN) == HIGH);
+  
+  // Auto-enable engineering mode if not yet retrieved
+  if (!radar.engineeringRetrieved()) {
+    radar.requestStartEngineeringMode();
+  }
+
+  static unsigned long lastPrint = 0;
+  if (millis() - lastPrint > 1000) {
+    lastPrint = millis();
+    Serial.print("[Tele] Pres:");
+    Serial.print(radar.presenceDetected() ? "Y" : "N");
+    Serial.print(" Mov:");
+    Serial.print(radar.movingTargetDetected() ? "Y" : "N");
+    Serial.print(" Dist:");
+    Serial.print(radar.detectionDistance());
+    Serial.print("cm OUT:");
+    Serial.print(outState ? "HIGH" : "LOW");
+    Serial.print(" EngRetrieved:");
+    Serial.print(radar.engineeringRetrieved() ? "Y" : "N");
+    Serial.print(" RX_Avail:");
+    Serial.println(radarSerial.available());
+  }
+
+  String json = "{";
+  json += "\"presence\":" + String((radar.presenceDetected() || outState) ? "true" : "false") + ",";
+  json += "\"moving_detected\":" + String(radar.movingTargetDetected() ? "true" : "false") + ",";
+  json += "\"static_detected\":" + String(radar.stationaryTargetDetected() ? "true" : "false") + ",";
+  json += "\"distance\":" + String(radar.detectionDistance()) + ",";
+  json += "\"out_pin\":" + String(outState ? "true" : "false") + ",";
+  json += "\"moving_energy\":[";
+  for (int i = 0; i <= 8; i++) {
+    json += String(radar.movingEnergyAtGate(i));
+    if (i < 8) json += ",";
+  }
+  json += "],\"static_energy\":[";
+  for (int i = 0; i <= 8; i++) {
+    json += String(radar.stationaryEnergyAtGate(i));
+    if (i < 8) json += ",";
+  }
+  json += "]}";
+  server.send(200, "application/json", json);
 }
